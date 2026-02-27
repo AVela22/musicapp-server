@@ -1,14 +1,11 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yt_dlp
-import requests
-import re
 import os
 
 app = Flask(__name__)
 CORS(app)
 
-# ── SoundCloud search ─────────────────────────────────────────────────────
 @app.route('/search')
 def search():
     query = request.args.get('q', '').strip()
@@ -24,46 +21,75 @@ def search():
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f'scsearch8:{query}', download=False)
-            entries = info.get('entries', [])
+            entries = info.get('entries', []) or []
             results = []
             for e in entries:
                 if not e:
                     continue
-                duration_s = e.get('duration') or 0
-                m = int(duration_s) // 60
-                s = int(duration_s) % 60
+                duration_s = int(e.get('duration') or 0)
+                m = duration_s // 60
+                s = duration_s % 60
+                thumbs = e.get('thumbnails') or []
+                thumb  = thumbs[-1].get('url', '') if thumbs else e.get('thumbnail', '')
                 results.append({
-                    'id':       e.get('id') or e.get('url', ''),
+                    'id':       str(e.get('id', '')),
                     'url':      e.get('url', ''),
                     'title':    e.get('title', 'Sin titulo'),
                     'artist':   e.get('uploader') or e.get('channel') or 'Desconocido',
                     'duration': f"{m}:{str(s).zfill(2)}",
-                    'thumb':    e.get('thumbnail') or e.get('thumbnails', [{}])[-1].get('url', '') if e.get('thumbnails') else '',
+                    'thumb':    thumb,
                     'source':   'soundcloud',
                 })
             return jsonify(results)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ── SoundCloud stream URL ─────────────────────────────────────────────────
+
 @app.route('/stream')
 def stream():
     url = request.args.get('url', '').strip()
     if not url:
         return jsonify({'error': 'No URL'}), 400
 
+    # Forzar formato progresivo (mp3/m4a directo, no HLS)
     ydl_opts = {
-        'format': 'bestaudio/best',
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        # http_dash_segments y hls no sirven en expo-av
+        # forzar formato progresivo de SoundCloud
+        'format': 'http_mp3_128/bestaudio[protocol=https]/bestaudio',
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            audio_url = info.get('url')
+
+            # buscar URL directa entre los formatos disponibles
+            formats = info.get('formats') or []
+            audio_url = None
+
+            # primero intentar mp3 progresivo
+            for f in formats:
+                proto = f.get('protocol', '')
+                mime  = f.get('ext', '')
+                if proto == 'https' and mime in ('mp3', 'm4a'):
+                    audio_url = f.get('url')
+                    break
+
+            # si no, cualquier https directo
+            if not audio_url:
+                for f in formats:
+                    if f.get('protocol') == 'https' and f.get('url'):
+                        audio_url = f.get('url')
+                        break
+
+            # ultimo recurso: url principal
+            if not audio_url:
+                audio_url = info.get('url')
+
             if not audio_url:
                 return jsonify({'error': 'No stream URL found'}), 404
+
             return jsonify({
                 'url':      audio_url,
                 'title':    info.get('title', ''),
@@ -72,9 +98,11 @@ def stream():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/ping')
 def ping():
     return jsonify({'status': 'ok'})
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
