@@ -1,9 +1,11 @@
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 import yt_dlp
 import re
 import os
 
 app = Flask(__name__)
+CORS(app)
 
 def is_valid_video_id(video_id):
     return bool(re.match(r'^[a-zA-Z0-9_-]{11}$', video_id))
