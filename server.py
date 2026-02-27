@@ -31,9 +31,11 @@ def search():
                 s = duration_s % 60
                 thumbs = e.get('thumbnails') or []
                 thumb  = thumbs[-1].get('url', '') if thumbs else e.get('thumbnail', '')
+                # guardamos la webpage_url de soundcloud
+                sc_url = e.get('webpage_url') or e.get('url', '')
                 results.append({
                     'id':       str(e.get('id', '')),
-                    'url':      e.get('url', ''),
+                    'url':      sc_url,
                     'title':    e.get('title', 'Sin titulo'),
                     'artist':   e.get('uploader') or e.get('channel') or 'Desconocido',
                     'duration': f"{m}:{str(s).zfill(2)}",
@@ -51,44 +53,32 @@ def stream():
     if not url:
         return jsonify({'error': 'No URL'}), 400
 
-    # Forzar formato progresivo (mp3/m4a directo, no HLS)
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        # http_dash_segments y hls no sirven en expo-av
-        # forzar formato progresivo de SoundCloud
-        'format': 'http_mp3_128/bestaudio[protocol=https]/bestaudio',
+        'format': 'bestaudio',
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-
-            # buscar URL directa entre los formatos disponibles
             formats = info.get('formats') or []
+
             audio_url = None
 
-            # primero intentar mp3 progresivo
-            for f in formats:
+            # buscar formato progresivo (no hls, no dash)
+            for f in reversed(formats):
                 proto = f.get('protocol', '')
-                mime  = f.get('ext', '')
-                if proto == 'https' and mime in ('mp3', 'm4a'):
+                if proto in ('https', 'http') and f.get('url'):
                     audio_url = f.get('url')
                     break
 
-            # si no, cualquier https directo
-            if not audio_url:
-                for f in formats:
-                    if f.get('protocol') == 'https' and f.get('url'):
-                        audio_url = f.get('url')
-                        break
-
-            # ultimo recurso: url principal
+            # fallback a url principal
             if not audio_url:
                 audio_url = info.get('url')
 
             if not audio_url:
-                return jsonify({'error': 'No stream URL found'}), 404
+                return jsonify({'error': 'No stream URL'}), 404
 
             return jsonify({
                 'url':      audio_url,
