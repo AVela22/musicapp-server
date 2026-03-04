@@ -1,119 +1,208 @@
-from flask import Flask, jsonify, request, send_file, Response
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import yt_dlp
 import os
-import tempfile
 import requests as req
+import concurrent.futures
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def pick_best_audio(formats):
+    """
+    Devuelve la URL del mejor formato de audio progresivo (http/https).
+    Evita HLS (m3u8) y DASH porque expo-av los reproduce a velocidad incorrecta.
+    Prefiere: mp3 > m4a/aac > opus/ogg > cualquier http
+    """
+    if not formats:
+        return None
+
+    def score(f):
+        proto = f.get('protocol', '')
+        ext   = f.get('ext', '')
+        acodec = f.get('acodec', '')
+        if proto not in ('https', 'http'):
+            return -1                          # descarta HLS/DASH
+        if ext == 'mp3' or 'mp3' in acodec:   return 100
+        if ext in ('m4a',) or 'aac' in acodec: return 80
+        if ext in ('ogg', 'opus') or 'opus' in acodec: return 60
+        if f.get('url'):                        return 10
+        return -1
+
+    ranked = sorted(formats, key=score, reverse=True)
+    for f in ranked:
+        if score(f) >= 0 and f.get('url'):
+            return f['url']
+    return None
+
+
+def format_duration(seconds):
+    s = int(seconds or 0)
+    return f"{s // 60}:{str(s % 60).zfill(2)}"
+
+
+def entry_to_result(e, source):
+    if not e:
+        return None
+    duration_s = int(e.get('duration') or 0)
+    thumbs = e.get('thumbnails') or []
+    # YouTube da muchas miniaturas, preferir la de mejor resolución pero no la más grande (lenta)
+    thumb = ''
+    if thumbs:
+        # intentar la de índice -2 (suele ser 480px), si no la última
+        candidates = [t for t in thumbs if t.get('url')]
+        if len(candidates) >= 2:
+            thumb = candidates[-2].get('url', '')
+        elif candidates:
+            thumb = candidates[-1].get('url', '')
+    if not thumb:
+        thumb = e.get('thumbnail', '')
+
+    vid_id = str(e.get('id', ''))
+    url    = e.get('webpage_url') or e.get('url', '')
+
+    return {
+        'id':       f"{source}_{vid_id}",
+        'url':      url,
+        'title':    e.get('title', 'Sin título'),
+        'artist':   e.get('uploader') or e.get('channel') or 'Desconocido',
+        'duration': format_duration(duration_s),
+        'thumb':    thumb,
+        'source':   source,
+    }
+
+
+def search_source(query, source_prefix, n=6):
+    """Busca en una fuente (ytsearch / scsearch) y retorna lista de resultados."""
+    ydl_opts = {
+        'quiet': True, 'no_warnings': True,
+        'extract_flat': True,
+        'playlist_items': f'1-{n}',
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info    = ydl.extract_info(f'{source_prefix}{n}:{query}', download=False)
+            entries = info.get('entries') or []
+            results = []
+            for e in entries:
+                r = entry_to_result(e, source_prefix.replace('search', '').strip(':') or source_prefix)
+                if r:
+                    results.append(r)
+            return results
+    except Exception as ex:
+        print(f'[search_source] {source_prefix} error: {ex}')
+        return []
+
+
+# ── Rutas ──────────────────────────────────────────────────────────────────
 
 @app.route('/search')
 def search():
     query = request.args.get('q', '').strip()
     if not query:
         return jsonify({'error': 'No query'}), 400
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'extract_flat': True, 'playlist_items': '1-8',
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info    = ydl.extract_info(f'scsearch8:{query}', download=False)
-            entries = info.get('entries', []) or []
-            results = []
-            for e in entries:
-                if not e: continue
-                duration_s = int(e.get('duration') or 0)
-                thumbs = e.get('thumbnails') or []
-                thumb  = thumbs[-1].get('url','') if thumbs else e.get('thumbnail','')
-                results.append({
-                    'id':       str(e.get('id','')),
-                    'url':      e.get('webpage_url') or e.get('url',''),
-                    'title':    e.get('title','Sin titulo'),
-                    'artist':   e.get('uploader') or e.get('channel') or 'Desconocido',
-                    'duration': f"{duration_s//60}:{str(duration_s%60).zfill(2)}",
-                    'thumb':    thumb,
-                    'source':   'soundcloud',
-                })
-            return jsonify(results)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+
+    # Busca en YouTube y SoundCloud en paralelo
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        fut_yt = executor.submit(search_source, query, 'ytsearch', 6)
+        fut_sc = executor.submit(search_source, query, 'scsearch', 6)
+        yt_results = fut_yt.result()
+        sc_results = fut_sc.result()
+
+    # Intercalar resultados: YT, SC, YT, SC ... para variedad
+    merged = []
+    for yt, sc in zip(yt_results, sc_results):
+        merged.append(yt)
+        merged.append(sc)
+    # Agregar los sobrantes si una fuente devolvió más
+    merged += yt_results[len(sc_results):]
+    merged += sc_results[len(yt_results):]
+
+    return jsonify(merged)
 
 
 @app.route('/stream')
 def stream():
-    url = request.args.get('url','').strip()
+    url = request.args.get('url', '').strip()
     if not url:
         return jsonify({'error': 'No URL'}), 400
+
+    # Formato explícito: preferir mp3/m4a progresivos, nunca HLS
     ydl_opts = {
         'quiet': True, 'no_warnings': True,
-        'extract_flat': False, 'format': 'bestaudio',
+        'extract_flat': False,
+        # bestaudio[protocol^=http] filtra solo progresivos
+        'format': 'bestaudio[protocol^=http]/bestaudio',
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info    = ydl.extract_info(url, download=False)
             formats = info.get('formats') or []
-            audio_url = None
-            for f in reversed(formats):
-                if f.get('protocol') in ('https','http') and f.get('url'):
-                    audio_url = f.get('url')
-                    break
+
+            audio_url = pick_best_audio(formats)
+
+            # fallback: lo que yt-dlp eligió directamente
             if not audio_url:
                 audio_url = info.get('url')
+
             if not audio_url:
                 return jsonify({'error': 'No stream URL'}), 404
-            return jsonify({'url': audio_url, 'title': info.get('title',''), 'duration': info.get('duration',0)})
+
+            return jsonify({
+                'url':      audio_url,
+                'title':    info.get('title', ''),
+                'duration': info.get('duration', 0),
+                'format':   info.get('ext', ''),
+            })
     except Exception as e:
+        print(f'[stream] error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/download')
 def download():
-    url   = request.args.get('url','').strip()
-    title = request.args.get('title','song').strip()
+    url   = request.args.get('url', '').strip()
+    title = request.args.get('title', 'song').strip()
     if not url:
         return jsonify({'error': 'No URL'}), 400
 
-    safe_title = "".join(c for c in title if c.isalnum() or c in (' ','-','_')).strip() or 'song'
+    safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip() or 'song'
 
-    # obtener URL de audio directo via yt-dlp
     ydl_opts = {
         'quiet': True, 'no_warnings': True,
-        'extract_flat': False, 'format': 'bestaudio',
+        'extract_flat': False,
+        'format': 'bestaudio[protocol^=http]/bestaudio',
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info    = ydl.extract_info(url, download=False)
             formats = info.get('formats') or []
-            audio_url = None
-            # preferir mp3 o m4a progresivo
-            for f in reversed(formats):
-                if f.get('protocol') in ('https','http') and f.get('url'):
-                    audio_url = f.get('url')
-                    break
+
+            audio_url = pick_best_audio(formats)
             if not audio_url:
                 audio_url = info.get('url')
             if not audio_url:
                 return jsonify({'error': 'No audio URL'}), 404
 
-        # hacer proxy del archivo al cliente
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Referer': 'https://soundcloud.com',
-        }
-        r = req.get(audio_url, headers=headers, stream=True, timeout=30)
-        if r.status_code != 200:
-            return jsonify({'error': f'Upstream error {r.status_code}'}), 502
+        # Detectar referer según la fuente
+        referer = 'https://www.youtube.com/' if 'youtube' in url or 'youtu.be' in url else 'https://soundcloud.com'
 
-        content_type = r.headers.get('Content-Type', 'audio/mpeg')
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': referer,
+        }
+        r = req.get(audio_url, headers=headers, stream=True, timeout=60)
+        if r.status_code != 200:
+            return jsonify({'error': f'Upstream {r.status_code}'}), 502
 
         def generate():
-            for chunk in r.iter_content(chunk_size=8192):
+            for chunk in r.iter_content(chunk_size=16384):
                 if chunk:
                     yield chunk
 
-        response = Response(
+        return Response(
             generate(),
             status=200,
             mimetype='audio/mpeg',
@@ -122,9 +211,8 @@ def download():
                 'Content-Type': 'audio/mpeg',
             }
         )
-        return response
-
     except Exception as e:
+        print(f'[download] error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
