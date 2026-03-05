@@ -135,13 +135,9 @@ def search():
 
 
 def make_ydl_opts(is_youtube=False):
-    """
-    Opciones base de yt-dlp con User-Agent real para evitar bloqueos
-    en servidores cloud (Render, Railway, etc.)
-    """
     opts = {
-        'quiet': True,
-        'no_warnings': True,
+        'quiet':        False,      # mostrar errores en logs de Render
+        'no_warnings':  False,
         'extract_flat': False,
         'socket_timeout': 30,
         'http_headers': {
@@ -151,25 +147,73 @@ def make_ydl_opts(is_youtube=False):
                 'Chrome/124.0.0.0 Safari/537.36'
             ),
             'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': '*/*',
         },
     }
     if is_youtube:
-        # m4a es compatible con expo-av sin necesidad de transcodificar
-        opts['format'] = (
-            'bestaudio[ext=m4a][abr<=160]'
-            '/bestaudio[ext=m4a]'
-            '/bestaudio[ext=webm]'
-            '/bestaudio'
-        )
+        # tv_embedded es el cliente con menos restricciones en IPs de datacenter
+        opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio'
         opts['extractor_args'] = {
             'youtube': {
-                # Fuerza el cliente "web" que devuelve URLs directas más estables
-                'player_client': ['web', 'android'],
+                'player_client': ['tv_embedded', 'web'],
+                'player_skip':   ['webpage', 'configs'],
             }
         }
     else:
         opts['format'] = 'bestaudio[protocol^=http]/bestaudio'
     return opts
+
+
+def get_audio_url_youtube(url):
+    """
+    Intenta extraer la URL de audio de YouTube probando múltiples clientes
+    en orden de menor a mayor restricción en datacenters.
+    """
+    clients = [
+        ['tv_embedded'],
+        ['web_embedded'],
+        ['mweb'],
+        ['web'],
+        ['android'],
+    ]
+    for client_list in clients:
+        try:
+            opts = {
+                'quiet': False,
+                'no_warnings': False,
+                'extract_flat': False,
+                'socket_timeout': 25,
+                'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+                'http_headers': {
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/124.0.0.0 Safari/537.36'
+                    ),
+                },
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': client_list,
+                        'player_skip':   ['webpage', 'configs'],
+                    }
+                },
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                audio_url = info.get('url')
+                if not audio_url:
+                    fmts = info.get('formats') or []
+                    for f in reversed(fmts):
+                        if f.get('url') and f.get('acodec') not in (None, 'none'):
+                            audio_url = f['url']
+                            break
+                if audio_url:
+                    print(f'[yt] client={client_list}  ext={info.get("ext")}  got URL ok')
+                    return audio_url, info
+        except Exception as ex:
+            print(f'[yt] client={client_list} failed: {ex}')
+            continue
+    return None, None
 
 
 @app.route('/stream')
@@ -181,30 +225,95 @@ def stream():
     is_youtube = 'youtube.com' in url or 'youtu.be' in url
 
     try:
-        with yt_dlp.YoutubeDL(make_ydl_opts(is_youtube)) as ydl:
-            info    = ydl.extract_info(url, download=False)
-            formats = info.get('formats') or []
-
-            # Cadena de fallback para obtener la URL de audio final
-            audio_url = info.get('url')                          # URL ya procesada por yt-dlp
+        if is_youtube:
+            audio_url, info = get_audio_url_youtube(url)
             if not audio_url:
-                audio_url = pick_best_audio(formats)             # buscar en lista de formatos
-            if not audio_url and formats:
-                audio_url = formats[-1].get('url')               # último recurso: primer formato
+                return jsonify({'error': 'YouTube blocked all clients on this server IP. Try a SoundCloud result.'}), 500
+        else:
+            with yt_dlp.YoutubeDL(make_ydl_opts(False)) as ydl:
+                info     = ydl.extract_info(url, download=False)
+                formats  = info.get('formats') or []
+                audio_url = pick_best_audio(formats) or info.get('url')
+                if not audio_url and formats:
+                    audio_url = formats[-1].get('url')
 
-            if not audio_url:
-                return jsonify({'error': 'No stream URL found'}), 404
+        if not audio_url:
+            return jsonify({'error': 'No stream URL found'}), 404
 
-            print(f'[stream] ok  format={info.get("ext")}  url[:60]={audio_url[:60]}')
+        print(f'[stream] ok  is_yt={is_youtube}  url[:80]={audio_url[:80]}')
 
-            return jsonify({
-                'url':      audio_url,
-                'title':    info.get('title', ''),
-                'duration': info.get('duration', 0),
-                'format':   info.get('ext', ''),
-            })
+        return jsonify({
+            'url':      audio_url,
+            'title':    (info or {}).get('title', ''),
+            'duration': (info or {}).get('duration', 0),
+            'format':   (info or {}).get('ext', ''),
+        })
     except Exception as e:
         print(f'[stream] error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/proxy')
+def proxy():
+    """
+    Hace streaming del audio directamente desde el servidor.
+    Útil para YouTube: la URL resuelta es válida desde la IP del servidor,
+    así el cliente solo consume bytes del proxy y nunca toca YouTube directo.
+    Soporta Range requests para que expo-audio pueda hacer seek.
+    """
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({'error': 'No URL'}), 400
+
+    is_youtube = 'youtube.com' in url or 'youtu.be' in url
+
+    try:
+        if is_youtube:
+            audio_url, info = get_audio_url_youtube(url)
+            if not audio_url:
+                return jsonify({'error': 'No YouTube URL'}), 500
+        else:
+            with yt_dlp.YoutubeDL(make_ydl_opts(False)) as ydl:
+                info = ydl.extract_info(url, download=False)
+                fmts = info.get('formats') or []
+                audio_url = pick_best_audio(fmts) or info.get('url')
+
+        if not audio_url:
+            return jsonify({'error': 'No audio URL'}), 404
+
+        # Reenviar Range header si el cliente lo manda (necesario para seek)
+        upstream_headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            ),
+            'Referer': 'https://www.youtube.com/' if is_youtube else 'https://soundcloud.com',
+        }
+        if 'Range' in request.headers:
+            upstream_headers['Range'] = request.headers['Range']
+
+        r = req.get(audio_url, headers=upstream_headers, stream=True, timeout=60)
+
+        def generate():
+            for chunk in r.iter_content(chunk_size=32768):
+                if chunk:
+                    yield chunk
+
+        resp_headers = {
+            'Content-Type':  r.headers.get('Content-Type', 'audio/mp4'),
+            'Accept-Ranges': 'bytes',
+        }
+        if 'Content-Length' in r.headers:
+            resp_headers['Content-Length'] = r.headers['Content-Length']
+        if 'Content-Range' in r.headers:
+            resp_headers['Content-Range'] = r.headers['Content-Range']
+
+        status_code = r.status_code if r.status_code in (200, 206) else 200
+        return Response(generate(), status=status_code, headers=resp_headers)
+
+    except Exception as e:
+        print(f'[proxy] error: {e}')
         return jsonify({'error': str(e)}), 500
 
 
@@ -216,29 +325,28 @@ def download():
         return jsonify({'error': 'No URL'}), 400
 
     safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip() or 'song'
+    is_youtube = 'youtube.com' in url or 'youtu.be' in url
 
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'extract_flat': False,
-        'format': 'bestaudio[protocol^=http]/bestaudio',
-    }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info    = ydl.extract_info(url, download=False)
-            formats = info.get('formats') or []
+        if is_youtube:
+            audio_url, _ = get_audio_url_youtube(url)
+        else:
+            ydl_opts = {
+                'quiet': True, 'no_warnings': True,
+                'extract_flat': False,
+                'format': 'bestaudio[protocol^=http]/bestaudio',
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info      = ydl.extract_info(url, download=False)
+                audio_url = pick_best_audio(info.get('formats') or []) or info.get('url')
 
-            audio_url = pick_best_audio(formats)
-            if not audio_url:
-                audio_url = info.get('url')
-            if not audio_url:
-                return jsonify({'error': 'No audio URL'}), 404
+        if not audio_url:
+            return jsonify({'error': 'No audio URL'}), 404
 
-        # Detectar referer según la fuente
-        referer = 'https://www.youtube.com/' if 'youtube' in url or 'youtu.be' in url else 'https://soundcloud.com'
-
+        referer = 'https://www.youtube.com/' if is_youtube else 'https://soundcloud.com'
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': referer,
+            'Referer':    referer,
         }
         r = req.get(audio_url, headers=headers, stream=True, timeout=60)
         if r.status_code != 200:
@@ -250,9 +358,7 @@ def download():
                     yield chunk
 
         return Response(
-            generate(),
-            status=200,
-            mimetype='audio/mpeg',
+            generate(), status=200, mimetype='audio/mpeg',
             headers={
                 'Content-Disposition': f'attachment; filename="{safe_title}.mp3"',
                 'Content-Type': 'audio/mpeg',
