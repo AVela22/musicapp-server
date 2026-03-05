@@ -134,6 +134,44 @@ def search():
     return jsonify(merged)
 
 
+def make_ydl_opts(is_youtube=False):
+    """
+    Opciones base de yt-dlp con User-Agent real para evitar bloqueos
+    en servidores cloud (Render, Railway, etc.)
+    """
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'socket_timeout': 30,
+        'http_headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            ),
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+    }
+    if is_youtube:
+        # m4a es compatible con expo-av sin necesidad de transcodificar
+        opts['format'] = (
+            'bestaudio[ext=m4a][abr<=160]'
+            '/bestaudio[ext=m4a]'
+            '/bestaudio[ext=webm]'
+            '/bestaudio'
+        )
+        opts['extractor_args'] = {
+            'youtube': {
+                # Fuerza el cliente "web" que devuelve URLs directas más estables
+                'player_client': ['web', 'android'],
+            }
+        }
+    else:
+        opts['format'] = 'bestaudio[protocol^=http]/bestaudio'
+    return opts
+
+
 @app.route('/stream')
 def stream():
     url = request.args.get('url', '').strip()
@@ -142,36 +180,22 @@ def stream():
 
     is_youtube = 'youtube.com' in url or 'youtu.be' in url
 
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'extract_flat': False,
-    }
-
-    # Para YouTube: dejar que yt-dlp elija el mejor audio (puede ser DASH/opus)
-    # Para SoundCloud y otros: preferir progresivo http
-    if is_youtube:
-        ydl_opts['format'] = 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio'
-    else:
-        ydl_opts['format'] = 'bestaudio[protocol^=http]/bestaudio'
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(make_ydl_opts(is_youtube)) as ydl:
             info    = ydl.extract_info(url, download=False)
             formats = info.get('formats') or []
 
-            # Para YouTube usamos la URL que yt-dlp ya procesó (descifró parámetro n)
-            if is_youtube:
-                audio_url = info.get('url')
-                # Si no, intentar pick_best_audio como fallback
-                if not audio_url:
-                    audio_url = pick_best_audio(formats)
-            else:
-                audio_url = pick_best_audio(formats)
-                if not audio_url:
-                    audio_url = info.get('url')
+            # Cadena de fallback para obtener la URL de audio final
+            audio_url = info.get('url')                          # URL ya procesada por yt-dlp
+            if not audio_url:
+                audio_url = pick_best_audio(formats)             # buscar en lista de formatos
+            if not audio_url and formats:
+                audio_url = formats[-1].get('url')               # último recurso: primer formato
 
             if not audio_url:
-                return jsonify({'error': 'No stream URL'}), 404
+                return jsonify({'error': 'No stream URL found'}), 404
+
+            print(f'[stream] ok  format={info.get("ext")}  url[:60]={audio_url[:60]}')
 
             return jsonify({
                 'url':      audio_url,
