@@ -10,43 +10,38 @@ CORS(app)
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-YDL_COMMON = {
+FAKE_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    ),
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+YDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'extract_flat': False,
-    # Solo formatos progresivos (http/https). Nunca HLS/DASH.
     'format': 'bestaudio[protocol^=http]/bestaudio',
-    # Spoofear como si viniera de un navegador real
-    'http_headers': {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/124.0.0.0 Safari/537.36'
-        ),
-        'Accept-Language': 'en-US,en;q=0.9',
-    },
+    'http_headers': FAKE_HEADERS,
 }
 
 
 def pick_best_audio(formats):
-    """
-    Devuelve el mejor formato de audio progresivo (http/https).
-    Evita HLS (m3u8) y DASH.
-    Prefiere: mp3 > m4a/aac > opus/ogg > cualquier http
-    """
+    """Elige la mejor URL de audio progresivo (http/https). Evita HLS/DASH."""
     if not formats:
-        return None
+        return None, None
 
     def score(f):
         proto  = f.get('protocol', '')
         ext    = f.get('ext', '')
         acodec = f.get('acodec', '')
-        if proto not in ('https', 'http'):
-            return -1
-        if ext == 'mp3' or 'mp3' in acodec:        return 100
-        if ext in ('m4a',) or 'aac' in acodec:     return 80
-        if ext in ('ogg', 'opus') or 'opus' in acodec: return 60
-        if f.get('url'):                             return 10
+        if proto not in ('https', 'http'):      return -1
+        if ext == 'mp3' or 'mp3' in acodec:    return 100
+        if ext == 'm4a' or 'aac' in acodec:    return 80
+        if ext in ('ogg','opus') or 'opus' in acodec: return 60
+        if f.get('url'):                        return 10
         return -1
 
     ranked = sorted(formats, key=score, reverse=True)
@@ -64,9 +59,8 @@ def format_duration(seconds):
 def entry_to_result(e, source):
     if not e:
         return None
-    duration_s = int(e.get('duration') or 0)
     thumbs = e.get('thumbnails') or []
-    thumb = ''
+    thumb  = ''
     if thumbs:
         candidates = [t for t in thumbs if t.get('url')]
         if len(candidates) >= 2:
@@ -84,86 +78,57 @@ def entry_to_result(e, source):
         'url':      url,
         'title':    e.get('title', 'Sin título'),
         'artist':   e.get('uploader') or e.get('channel') or 'Desconocido',
-        'duration': format_duration(duration_s),
+        'duration': format_duration(int(e.get('duration') or 0)),
         'thumb':    thumb,
         'source':   source,
     }
 
 
 def search_source(query, source_prefix, n=6):
-    ydl_opts = {
-        'quiet': True, 'no_warnings': True,
-        'extract_flat': True,
-        'playlist_items': f'1-{n}',
-    }
+    opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True, 'playlist_items': f'1-{n}'}
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info    = ydl.extract_info(f'{source_prefix}{n}:{query}', download=False)
             entries = info.get('entries') or []
-            results = []
-            for e in entries:
-                r = entry_to_result(e, source_prefix.replace('search', '').strip(':') or source_prefix)
-                if r:
-                    results.append(r)
-            return results
+            src     = source_prefix.replace('search', '').strip(':') or source_prefix
+            return [r for e in entries for r in [entry_to_result(e, src)] if r]
     except Exception as ex:
         print(f'[search_source] {source_prefix} error: {ex}')
         return []
 
 
-def resolve_audio_url(page_url):
-    """
-    Extrae la URL de audio real usando yt-dlp.
-    Devuelve (audio_url, http_headers_dict) o (None, None).
-    """
+def resolve_audio(page_url):
+    """Resuelve la URL de audio real con yt-dlp. Devuelve (url, fmt_headers)."""
     try:
-        with yt_dlp.YoutubeDL(YDL_COMMON) as ydl:
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info    = ydl.extract_info(page_url, download=False)
             formats = info.get('formats') or []
-
             audio_url, fmt = pick_best_audio(formats)
-
-            # fallback: URL elegida directamente por yt-dlp
             if not audio_url:
                 audio_url = info.get('url')
-
-            if not audio_url:
-                return None, None
-
-            # Algunos formatos incluyen sus propios headers (p.ej. YouTube firma)
-            extra_headers = {}
-            if fmt:
-                extra_headers = fmt.get('http_headers') or {}
-
-            return audio_url, extra_headers
+            extra = (fmt or {}).get('http_headers') or {}
+            return audio_url, extra
     except Exception as e:
-        print(f'[resolve_audio_url] error: {e}')
-        return None, None
+        print(f'[resolve_audio] error: {e}')
+        return None, {}
 
 
-def proxy_audio(audio_url, extra_headers=None, filename='audio.mp3', range_header=None):
+def make_proxy_response(audio_url, extra_headers, filename, range_header=None):
     """
-    Hace streaming del audio proxeado hacia el cliente.
-    Soporta Range requests para que expo-audio pueda hacer seek.
+    Proxea el audio hacia el cliente.
+    Soporta Range para que expo-av pueda hacer seek y detectar duración.
     """
     is_yt = 'googlevideo' in audio_url or 'youtube' in audio_url
 
-    headers = {
-        'User-Agent': (
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/124.0.0.0 Safari/537.36'
-        ),
-        'Referer': 'https://www.youtube.com/' if is_yt else 'https://soundcloud.com',
-        'Origin':  'https://www.youtube.com/' if is_yt else 'https://soundcloud.com',
-    }
+    headers = dict(FAKE_HEADERS)
+    headers['Referer'] = 'https://www.youtube.com/' if is_yt else 'https://soundcloud.com'
+    headers['Origin']  = headers['Referer']
     if extra_headers:
         headers.update(extra_headers)
     if range_header:
         headers['Range'] = range_header
 
     r = req.get(audio_url, headers=headers, stream=True, timeout=60)
-
     if r.status_code not in (200, 206):
         return jsonify({'error': f'Upstream {r.status_code}'}), 502
 
@@ -178,16 +143,11 @@ def proxy_audio(audio_url, extra_headers=None, filename='audio.mp3', range_heade
         'Cache-Control':       'no-cache',
         'Content-Disposition': f'inline; filename="{filename}"',
     }
-    # Propagar Content-Length y Content-Range si el upstream los manda
     for h in ('Content-Length', 'Content-Range'):
         if h in r.headers:
             resp_headers[h] = r.headers[h]
 
-    return Response(
-        generate(),
-        status=r.status_code,
-        headers=resp_headers,
-    )
+    return Response(generate(), status=r.status_code, headers=resp_headers)
 
 
 # ── Rutas ──────────────────────────────────────────────────────────────────
@@ -198,41 +158,40 @@ def search():
     if not query:
         return jsonify({'error': 'No query'}), 400
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        fut_yt = executor.submit(search_source, query, 'ytsearch', 6)
-        fut_sc = executor.submit(search_source, query, 'scsearch', 6)
-        yt_results = fut_yt.result()
-        sc_results = fut_sc.result()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        fut_yt = ex.submit(search_source, query, 'ytsearch', 6)
+        fut_sc = ex.submit(search_source, query, 'scsearch', 6)
+        yt_r   = fut_yt.result()
+        sc_r   = fut_sc.result()
 
     merged = []
-    for yt, sc in zip(yt_results, sc_results):
-        merged.append(yt)
-        merged.append(sc)
-    merged += yt_results[len(sc_results):]
-    merged += sc_results[len(yt_results):]
-
+    for yt, sc in zip(yt_r, sc_r):
+        merged += [yt, sc]
+    merged += yt_r[len(sc_r):]
+    merged += sc_r[len(yt_r):]
     return jsonify(merged)
 
 
 @app.route('/stream')
 def stream():
     """
-    ANTES: devolvía la URL cruda de YouTube (fallaba por bloqueos de IP).
-    AHORA: proxea el audio directamente desde el servidor, evitando bloqueos.
-    Soporta Range requests para seek/scrubbing en el cliente.
+    Proxea el audio del servidor al cliente.
+    El cliente NO recibe URLs crudas de YouTube (que fallan por bloqueos de IP).
+    Soporta Range requests para seek / detección de duración.
     """
     url = request.args.get('url', '').strip()
     if not url:
         return jsonify({'error': 'No URL'}), 400
 
-    audio_url, extra_headers = resolve_audio_url(url)
+    audio_url, extra = resolve_audio(url)
     if not audio_url:
-        return jsonify({'error': 'No se pudo resolver la URL de audio'}), 500
+        return jsonify({'error': 'No se pudo resolver el audio'}), 500
 
-    range_header = request.headers.get('Range')
-    safe_title   = 'audio'
-
-    return proxy_audio(audio_url, extra_headers, filename=safe_title + '.mp3', range_header=range_header)
+    return make_proxy_response(
+        audio_url, extra,
+        filename='audio.mp3',
+        range_header=request.headers.get('Range'),
+    )
 
 
 @app.route('/download')
@@ -242,13 +201,12 @@ def download():
     if not url:
         return jsonify({'error': 'No URL'}), 400
 
-    safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip() or 'song'
-
-    audio_url, extra_headers = resolve_audio_url(url)
+    safe = "".join(c for c in title if c.isalnum() or c in (' ','-','_')).strip() or 'song'
+    audio_url, extra = resolve_audio(url)
     if not audio_url:
         return jsonify({'error': 'No audio URL'}), 500
 
-    return proxy_audio(audio_url, extra_headers, filename=safe_title + '.mp3')
+    return make_proxy_response(audio_url, extra, filename=safe + '.mp3')
 
 
 @app.route('/ping')
