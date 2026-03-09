@@ -8,6 +8,9 @@ import concurrent.futures
 app = Flask(__name__)
 CORS(app)
 
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY', '')
+SC_CLIENT_ID    = os.environ.get('SC_CLIENT_ID', '6QNse33jZWUMFNeFn5QzGfBErFktk7Sa')
+
 FAKE_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -24,6 +27,75 @@ FAKE_HEADERS = {
 def fmt_dur(seconds):
     s = int(seconds or 0)
     return f"{s // 60}:{str(s % 60).zfill(2)}"
+
+
+def fmt_iso_dur(iso):
+    """Convierte PT3M45S → '3:45'"""
+    import re
+    m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso or '')
+    if not m:
+        return '0:00'
+    h, mn, s = (int(x or 0) for x in m.groups())
+    total = h * 3600 + mn * 60 + s
+    return fmt_dur(total)
+
+
+def search_youtube_api(query, n=8):
+    """Búsqueda con YouTube Data API v3 — más rápida y confiable."""
+    if not YOUTUBE_API_KEY:
+        return []
+    try:
+        # 1. Search
+        search_res = req.get(
+            'https://www.googleapis.com/youtube/v3/search',
+            params={
+                'part':       'snippet',
+                'q':          query,
+                'type':       'video',
+                'maxResults': n,
+                'key':        YOUTUBE_API_KEY,
+            },
+            timeout=10,
+        )
+        if not search_res.ok:
+            print(f'[yt-api] search error: {search_res.status_code}')
+            return []
+
+        items = search_res.json().get('items', [])
+        if not items:
+            return []
+
+        # 2. Videos details (duración)
+        ids = ','.join(i['id']['videoId'] for i in items)
+        details_res = req.get(
+            'https://www.googleapis.com/youtube/v3/videos',
+            params={'part': 'contentDetails', 'id': ids, 'key': YOUTUBE_API_KEY},
+            timeout=10,
+        )
+        durations = {}
+        if details_res.ok:
+            for v in details_res.json().get('items', []):
+                durations[v['id']] = fmt_iso_dur(v['contentDetails']['duration'])
+
+        results = []
+        for item in items:
+            vid_id  = item['id']['videoId']
+            snippet = item['snippet']
+            thumbs  = snippet.get('thumbnails', {})
+            thumb   = (thumbs.get('high') or thumbs.get('medium') or thumbs.get('default') or {}).get('url', '')
+            results.append({
+                'id':       f"youtube_{vid_id}",
+                'url':      f"https://www.youtube.com/watch?v={vid_id}",
+                'title':    snippet.get('title', 'Sin título'),
+                'artist':   snippet.get('channelTitle', 'Desconocido'),
+                'duration': durations.get(vid_id, '0:00'),
+                'thumb':    thumb,
+                'source':   'youtube',
+            })
+        return results
+    except Exception as e:
+        print(f'[yt-api] error: {e}')
+        return []
 
 
 def entry_to_song(e, source):
@@ -47,41 +119,44 @@ def entry_to_song(e, source):
     }
 
 
-def search_source(query, prefix, n=6):
+def search_soundcloud(query, n=6):
+    """Búsqueda SC con yt-dlp + client_id."""
     opts = {
-        'quiet':        True,
-        'no_warnings':  True,
-        'extract_flat': True,
+        'quiet':          True,
+        'no_warnings':    True,
+        'extract_flat':   True,
         'playlist_items': f'1-{n}',
+        'extractor_args': {'soundcloud': {'client_id': [SC_CLIENT_ID]}},
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f'{prefix}{n}:{query}', download=False)
+            info = ydl.extract_info(f'scsearch{n}:{query}', download=False)
             return [s for e in (info.get('entries') or [])
-                    for s in [entry_to_song(e, prefix.replace('search', ''))] if s]
+                    for s in [entry_to_song(e, 'soundcloud')] if s]
     except Exception as ex:
-        print(f'[search] {prefix} error: {ex}')
+        print(f'[search] SC error: {ex}')
         return []
 
 
 def resolve_stream_url(page_url):
     """Obtiene la URL directa de audio de YT o SC."""
+    is_sc = 'soundcloud.com' in page_url
     opts = {
-        'quiet':       True,
-        'no_warnings': True,
-        'format':      'bestaudio[protocol^=http]/bestaudio',
+        'quiet':        True,
+        'no_warnings':  True,
+        'format':       'bestaudio[protocol^=http]/bestaudio',
         'http_headers': FAKE_HEADERS,
     }
+    if is_sc:
+        opts['extractor_args'] = {'soundcloud': {'client_id': [SC_CLIENT_ID]}}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(page_url, download=False)
-            # Intentar formatos primero
             formats = info.get('formats') or []
             for f in sorted(formats, key=lambda x: x.get('abr') or 0, reverse=True):
                 proto = f.get('protocol', '')
                 if proto in ('https', 'http') and f.get('url'):
                     return f['url'], f.get('http_headers') or {}
-            # Fallback a url directa
             if info.get('url'):
                 return info['url'], {}
     except Exception as e:
@@ -106,8 +181,8 @@ def search():
     print(f'[search] query: {query}')
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        sc_fut = ex.submit(search_source, query, 'scsearch', 6)
-        yt_fut = ex.submit(search_source, query, 'ytsearch', 6)
+        sc_fut = ex.submit(search_soundcloud, query, 6)
+        yt_fut = ex.submit(search_youtube_api, query, 8)
         sc_r   = sc_fut.result()
         yt_r   = yt_fut.result()
 
@@ -124,10 +199,6 @@ def search():
 
 @app.route('/stream')
 def stream():
-    """
-    Recibe ?url=<page_url>  (la webpage_url de YT o SC)
-    Resuelve la URL de audio y la proxea al cliente.
-    """
     page_url = request.args.get('url', '').strip()
     if not page_url:
         return jsonify({'error': 'Falta url'}), 400
@@ -140,7 +211,6 @@ def stream():
 
     print(f'[stream] URL resuelta OK')
 
-    # Construir headers para el request upstream
     headers = dict(FAKE_HEADERS)
     is_yt = 'youtube' in page_url or 'youtu.be' in page_url
     headers['Referer'] = 'https://www.youtube.com/' if is_yt else 'https://soundcloud.com/'
@@ -182,5 +252,3 @@ def stream():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
-## original de yoputube
