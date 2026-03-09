@@ -15,7 +15,7 @@ CORS(app)
 # ══════════════════════════════════════════════════════════════════════════
 #  CONFIG — pon estas variables en Render > Environment
 # ══════════════════════════════════════════════════════════════════════════
-FTP_HOST       = os.environ.get('FTP_HOST',       'ftp.centerdatatech.com')
+FTP_HOST       = os.environ.get('FTP_HOST',       'mx116.hostgator.mx')
 FTP_PORT       = int(os.environ.get('FTP_PORT',   21))
 FTP_USER       = os.environ.get('FTP_USER',       'appmus1c@centerdatatech.com')
 FTP_PASS       = os.environ.get('FTP_PASS',       '')   # solo en Render env vars
