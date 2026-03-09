@@ -46,7 +46,7 @@ def entry_to_song(e, source):
         'source':   source,
     }
 
-
+##Modificado
 def search_source(query, prefix, n=6):
     opts = {
         'quiet':        True,
@@ -54,6 +54,8 @@ def search_source(query, prefix, n=6):
         'extract_flat': True,
         'playlist_items': f'1-{n}',
     }
+    if 'scsearch' in prefix:
+        opts['extractor_args'] = {'soundcloud': {'client_id': ['6QNse33jZWUMFNeFn5QzGfBErFktk7Sa']}}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f'{prefix}{n}:{query}', download=False)
@@ -63,7 +65,7 @@ def search_source(query, prefix, n=6):
         print(f'[search] {prefix} error: {ex}')
         return []
 
-
+## aca se modiifco pero aun jala YT
 def resolve_stream_url(page_url):
     """Obtiene la URL directa de audio de YT o SC."""
     opts = {
