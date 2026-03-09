@@ -154,3 +154,16 @@ def stream():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+
+@app.route('/resolve')
+def resolve():
+    page_url = request.args.get('url', '').strip()
+    if not page_url:
+        return jsonify({'error': 'Falta url'}), 400
+    print(f'[resolve] resolviendo: {page_url}')
+    audio_url, _ = resolve_stream_url(page_url)
+    if not audio_url:
+        return jsonify({'error': 'No se pudo resolver'}), 500
+    print(f'[resolve] OK')
+    return jsonify({'url': audio_url})
