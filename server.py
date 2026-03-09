@@ -8,7 +8,6 @@ import concurrent.futures
 app = Flask(__name__)
 CORS(app)
 
-# SoundCloud client_id — ponlo también en Render > Environment como SC_CLIENT_ID
 SC_CLIENT_ID = os.environ.get('SC_CLIENT_ID', '6QNse33jZWUMFNeFn5QzGfBErFktk7Sa')
 
 FAKE_HEADERS = {
@@ -66,10 +65,12 @@ def search_source(query, prefix, n=6):
 
 def resolve_stream_url(page_url):
     is_sc = 'soundcloud.com' in page_url
+    # Para YT usamos bestaudio sin filtrar por protocolo primero
+    fmt = 'bestaudio/best' if not is_sc else 'bestaudio[protocol^=http]/bestaudio'
     opts = {
         'quiet':        True,
         'no_warnings':  True,
-        'format':       'bestaudio[protocol^=http]/bestaudio',
+        'format':       fmt,
         'http_headers': FAKE_HEADERS,
     }
     if is_sc:
@@ -78,10 +79,18 @@ def resolve_stream_url(page_url):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(page_url, download=False)
             formats = info.get('formats') or []
+            # Para YT: buscar formato de solo audio con url http/https
             for f in sorted(formats, key=lambda x: x.get('abr') or 0, reverse=True):
                 proto = f.get('protocol', '')
-                if proto in ('https', 'http') and f.get('url'):
+                vcodec = f.get('vcodec', 'none')
+                if proto in ('https', 'http') and f.get('url') and vcodec == 'none':
+                    print(f'[resolve] formato elegido: ext={f.get("ext")} abr={f.get("abr")} proto={proto}')
                     return f['url'], f.get('http_headers') or {}
+            # Fallback: cualquier formato con url
+            for f in sorted(formats, key=lambda x: x.get('abr') or 0, reverse=True):
+                if f.get('url') and f.get('protocol', '') in ('https', 'http'):
+                    return f['url'], f.get('http_headers') or {}
+            # Ultimo fallback
             if info.get('url'):
                 return info['url'], {}
     except Exception as e:
