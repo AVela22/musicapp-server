@@ -72,6 +72,8 @@ def resolve_stream_url(page_url):
         'format':      'bestaudio[protocol^=http]/bestaudio',
         'http_headers': FAKE_HEADERS,
     }
+    if 'soundcloud.com' in page_url:
+        opts['extractor_args'] = {'soundcloud': {'client_id': ['6QNse33jZWUMFNeFn5QzGfBErFktk7Sa']}}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(page_url, download=False)
