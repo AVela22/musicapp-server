@@ -59,8 +59,9 @@ def search_source(query, prefix, n=6):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f'{prefix}{n}:{query}', download=False)
-            return [s for e in (info.get('entries') or [])
-                    for s in [entry_to_song(e, prefix.replace('search', ''))] if s]
+            source_name = 'soundcloud' if 'scsearch' in prefix else 'youtube'
+        return [s for e in (info.get('entries') or [])
+        for s in [entry_to_song(e, source_name)] if s]
     except Exception as ex:
         print(f'[search] {prefix} error: {ex}')
         return []
