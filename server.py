@@ -66,6 +66,30 @@ def search_source(query, prefix, n=6):
         print(f'[search] {prefix} error: {ex}')
         return []
 
+def resolve_stream_url(page_url):
+    """Obtiene la URL directa de audio de YT o SC."""
+    opts = {
+        'quiet':       True,
+        'no_warnings': True,
+        'format':      'bestaudio[protocol^=http]/bestaudio',
+        'http_headers': FAKE_HEADERS,
+    }
+    if 'soundcloud.com' in page_url:
+        opts['extractor_args'] = {'soundcloud': {'client_id': ['6QNse33jZWUMFNeFn5QzGfBErFktk7Sa']}}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(page_url, download=False)
+            formats = info.get('formats') or []
+            for f in sorted(formats, key=lambda x: x.get('abr') or 0, reverse=True):
+                proto = f.get('protocol', '')
+                if proto in ('https', 'http') and f.get('url'):
+                    return f['url'], f.get('http_headers') or {}
+            if info.get('url'):
+                return info['url'], {}
+    except Exception as e:
+        print(f'[resolve] error: {e}')
+    return None, {}
+
 # ══════════════════════════════════════════════════════════════════════════
 #  RUTAS
 # ══════════════════════════════════════════════════════════════════════════
