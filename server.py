@@ -46,7 +46,7 @@ def entry_to_song(e, source):
         'source':   source,
     }
 
-##Modificado
+
 def search_source(query, prefix, n=6):
     opts = {
         'quiet':        True,
@@ -54,17 +54,15 @@ def search_source(query, prefix, n=6):
         'extract_flat': True,
         'playlist_items': f'1-{n}',
     }
-    if 'scsearch' in prefix:
-        opts['extractor_args'] = {'soundcloud': {'client_id': ['6QNse33jZWUMFNeFn5QzGfBErFktk7Sa']}}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f'{prefix}{n}:{query}', download=False)
-            source_name = 'soundcloud' if 'scsearch' in prefix else 'youtube'
             return [s for e in (info.get('entries') or [])
-                    for s in [entry_to_song(e, source_name)] if s]
+                    for s in [entry_to_song(e, prefix.replace('search', ''))] if s]
     except Exception as ex:
         print(f'[search] {prefix} error: {ex}')
         return []
+
 
 def resolve_stream_url(page_url):
     """Obtiene la URL directa de audio de YT o SC."""
@@ -74,16 +72,16 @@ def resolve_stream_url(page_url):
         'format':      'bestaudio[protocol^=http]/bestaudio',
         'http_headers': FAKE_HEADERS,
     }
-    if 'soundcloud.com' in page_url:
-        opts['extractor_args'] = {'soundcloud': {'client_id': ['6QNse33jZWUMFNeFn5QzGfBErFktk7Sa']}}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(page_url, download=False)
+            # Intentar formatos primero
             formats = info.get('formats') or []
             for f in sorted(formats, key=lambda x: x.get('abr') or 0, reverse=True):
                 proto = f.get('protocol', '')
                 if proto in ('https', 'http') and f.get('url'):
                     return f['url'], f.get('http_headers') or {}
+            # Fallback a url directa
             if info.get('url'):
                 return info['url'], {}
     except Exception as e:
